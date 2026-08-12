@@ -244,7 +244,10 @@ satBtn.onclick = () => {
 };
 
 // ---------- data loading ----------
-async function pageAll(path, params) {
+async function pageAll(path, params, orderCol) {
+  // an explicit order makes Range paging deterministic — without it PostgREST
+  // may return overlapping/missing rows across pages
+  params += `&order=${orderCol || "parcel_key"}`;
   const out = []; let from = 0, page = 1000;
   while (true) {
     const r = await fetch(`${SB}/${path}?${params}`, { headers: { ...H, Range: `${from}-${from + page - 1}` } });
@@ -261,7 +264,8 @@ const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(
 
 function featProps(p) {
   return { k: p.parcel_key, g: p._g, r: p._recent ? 1 : 0,
-           sel: p.parcel_key === selectedKey ? 1 : 0, d: p._dim ? 1 : 0 };
+           sel: p.parcel_key === selectedKey ? 1 : 0, d: p._dim ? 1 : 0,
+           pf: portfolioGid != null && p._match ? 1 : 0 };   // portfolio member — distinct color
 }
 function pointFC() {
   return { type: "FeatureCollection", features: parcels.filter(p => p._show).map(p => ({
@@ -274,39 +278,51 @@ function polyFC() {
 }
 
 function colorExpr() {
-  return ["match", ["get", "g"], "wh", cssVar("--series-1"), "mfg", cssVar("--series-3"), cssVar("--neutral-mark")];
+  // portfolio members get the distinct highlight color; dimmed parcels lose their
+  // use-color entirely so the portfolio stands out
+  return ["case",
+    ["==", ["get","pf"], 1], cssVar("--sel"),
+    ["==", ["get","d"], 1], cssVar("--neutral-mark"),
+    ["match", ["get", "g"], "wh", cssVar("--series-1"), "mfg", cssVar("--series-3"), cssVar("--neutral-mark")]];
 }
 const dimExpr = (lo, hi) => ["case", ["==", ["get","d"], 1], lo, hi];
 function strokeExpr() {
   return ["case", ["==", ["get","sel"], 1], cssVar("--sel"),
+          ["==", ["get","pf"], 1], cssVar("--surface-1"),
           ["==", ["get","r"], 1], cssVar("--accent"), "rgba(0,0,0,0)"];
+}
+function lineColorExpr() {
+  return ["case", ["==", ["get","sel"], 1], cssVar("--sel"),
+          ["==", ["get","pf"], 1], cssVar("--sel"),
+          ["==", ["get","r"], 1], cssVar("--accent"), colorExpr()];
 }
 
 function addLayers() {
   map.addSource("pts", { type: "geojson", data: pointFC() });
   map.addSource("polys", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
   map.addLayer({ id: "poly-fill", type: "fill", source: "polys", minzoom: 12,
-    paint: { "fill-color": colorExpr(), "fill-opacity": dimExpr(0.07, 0.42) } });
+    paint: { "fill-color": colorExpr(),
+             "fill-opacity": ["case", ["==", ["get","pf"], 1], 0.6, ["==", ["get","d"], 1], 0.07, 0.42] } });
   map.addLayer({ id: "poly-line", type: "line", source: "polys", minzoom: 12,
-    paint: { "line-color": ["case", ["==", ["get","sel"], 1], cssVar("--sel"),
-             ["==", ["get","r"], 1], cssVar("--accent"), colorExpr()],
-             "line-width": ["case", ["==", ["get","sel"], 1], 3.5, ["==", ["get","r"], 1], 2.5, 1],
+    paint: { "line-color": lineColorExpr(),
+             "line-width": ["case", ["==", ["get","sel"], 1], 3.5, ["==", ["get","pf"], 1], 2.5, ["==", ["get","r"], 1], 2.5, 1],
              "line-opacity": dimExpr(0.15, 1) } });
   map.addLayer({ id: "pt-circ", type: "circle", source: "pts", maxzoom: 12,
     paint: { "circle-color": colorExpr(),
-      "circle-radius": ["interpolate", ["linear"], ["zoom"], 8, 2.4, 12, 5],
-      "circle-opacity": dimExpr(0.15, 0.92),
+      "circle-radius": ["interpolate", ["linear"], ["zoom"],
+        8, ["case", ["==", ["get","pf"], 1], 4.5, 2.4],
+        12, ["case", ["==", ["get","pf"], 1], 9, 5]],
+      "circle-opacity": ["case", ["==", ["get","pf"], 1], 1, ["==", ["get","d"], 1], 0.15, 0.92],
       "circle-stroke-color": strokeExpr(),
       "circle-stroke-opacity": dimExpr(0.15, 1),
-      "circle-stroke-width": ["case", ["==", ["get","sel"], 1], 3, ["==", ["get","r"], 1], 2, 0] } });
+      "circle-stroke-width": ["case", ["==", ["get","sel"], 1], 3, ["==", ["get","pf"], 1], 1.5, ["==", ["get","r"], 1], 2, 0] } });
 }
 function refreshPaint() {
   if (!map.getLayer("pt-circ")) return;
   map.setPaintProperty("pt-circ", "circle-color", colorExpr());
   map.setPaintProperty("pt-circ", "circle-stroke-color", strokeExpr());
   map.setPaintProperty("poly-fill", "fill-color", colorExpr());
-  map.setPaintProperty("poly-line", "line-color", ["case", ["==", ["get","sel"], 1], cssVar("--sel"),
-    ["==", ["get","r"], 1], cssVar("--accent"), colorExpr()]);
+  map.setPaintProperty("poly-line", "line-color", lineColorExpr());
 }
 function refreshSources() {
   map.getSource("pts") && map.getSource("pts").setData(pointFC());
@@ -321,13 +337,21 @@ async function boot() {
     p._acres = p.land_sqft ? p.land_sqft / 43560 : null; p._norm = norm(p.owner_name); byKey.set(p.parcel_key, p); });
   buildFilterUI();
   applyFilters();
-  if (map.loaded()) addLayers(); else map.on("load", addLayers);
+  // map.loaded() stays false while basemap tiles stream (slow on satellite), even
+  // after "load" has fired — guard by layer presence and hook both paths
+  const ensureLayers = () => {
+    if (map.getSource("pts")) return;
+    try { addLayers(); }                       // throws while the style is still loading
+    catch (e) { setTimeout(ensureLayers, 300); }
+  };
+  map.on("load", ensureLayers);
+  ensureLayers();
   loadEntities();   // background — ownership layer
   document.getElementById("loading").textContent = "Loading parcel outlines…";
   try {
     const geoms = await pageAll("dash_geoms", "select=parcel_key,gj");
     geoms.forEach(g => polyIndex.set(g.parcel_key, JSON.parse(g.gj)));
-    map.getSource("polys") ? refreshSources() : map.on("load", refreshSources);
+    if (map.getSource("polys")) refreshSources();   // else addLayers picks them up at creation
   } catch (e) { console.warn("geoms", e); }
   document.getElementById("loading").style.display = "none";
 }
@@ -335,8 +359,8 @@ async function boot() {
 async function loadEntities() {
   try {
     const [ents, members] = await Promise.all([
-      pageAll("dash_entities", "select=owner_norm,matched_name,status,date_filed,principal_addr,registered_agent,principals,group_id,group_label,hidden_link"),
-      pageAll("dash_group_members", "select=group_id,group_label,owner_norm")
+      pageAll("dash_entities", "select=owner_norm,matched_name,status,date_filed,principal_addr,registered_agent,principals,group_id,group_label,hidden_link", "owner_norm"),
+      pageAll("dash_group_members", "select=group_id,group_label,owner_norm", "owner_norm")
     ]);
     ents.forEach(e => {
       // searchable blob: entity name, cluster label, all principal names (not the RA — noise)
@@ -464,7 +488,9 @@ window.showPortfolio = gid => {
   if (pts.length) {
     const b = new maplibregl.LngLatBounds();
     pts.forEach(p => b.extend([p.lon, p.lat]));
-    map.fitBounds(b, { padding: 70, maxZoom: 13 });
+    // let the layout settle (panel width transition), then fit the whole portfolio
+    setTimeout(() => { map.resize();
+      map.fitBounds(b, { padding: 80, maxZoom: 14, duration: 900 }); }, 220);
   }
 };
 
