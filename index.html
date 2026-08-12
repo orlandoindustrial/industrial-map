@@ -38,8 +38,9 @@
   .stat { text-align:right; }
   .stat b { display:block; font-size:17px; font-variant-numeric:tabular-nums; }
   .stat span { font-size:11px; color:var(--text-secondary); }
-  #themeBtn,#tableBtn,#csvBtn { border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);
+  #themeBtn,#tableBtn,#csvBtn,#satBtn { border:1px solid var(--border); background:var(--surface-2); color:var(--text-primary);
            border-radius:7px; padding:5px 11px; cursor:pointer; font-size:12.5px; }
+  #satBtn.on { border-color:var(--sel); color:var(--sel); font-weight:600; }
 
   #filters { display:flex; gap:10px; padding:8px 16px; border-bottom:1px solid var(--border);
              background:var(--surface-1); flex-wrap:wrap; align-items:flex-end; }
@@ -122,6 +123,7 @@
     <h1>Central FL Industrial Parcels</h1>
     <button id="tableBtn">Table view</button>
     <button id="csvBtn">Export CSV</button>
+    <button id="satBtn">🛰 Satellite</button>
     <button id="themeBtn">◐ Theme</button>
     <div id="stats">
       <div class="stat"><b id="stN">–</b><span>parcels shown</span></div>
@@ -208,20 +210,38 @@ document.getElementById("themeBtn").onclick = () => {
 };
 
 // ---------- map ----------
+let sat = localStorage.getItem("basemap") === "sat";
+const CARTO_TILES = t => ["a","b","c","d"].map(s => `https://${s}.basemaps.cartocdn.com/${t==="dark"?"dark_all":"light_all"}/{z}/{x}/{y}@2x.png`);
+const ESRI_TILES = ["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"];
+const LABEL_TILES = ["a","b","c","d"].map(s => `https://${s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}@2x.png`);
+const ATTR = "© OpenStreetMap contributors © CARTO · Imagery © Esri, Maxar, Earthstar Geographics";
 const basemap = t => ({
   version: 8,
-  sources: { carto: { type: "raster",
-    tiles: ["a","b","c","d"].map(s => `https://${s}.basemaps.cartocdn.com/${t==="dark"?"dark_all":"light_all"}/{z}/{x}/{y}@2x.png`),
-    tileSize: 256, attribution: "© OpenStreetMap contributors © CARTO" } },
-  layers: [{ id: "carto", type: "raster", source: "carto" }]
+  sources: {
+    carto: { type: "raster", tiles: sat ? ESRI_TILES : CARTO_TILES(t), tileSize: 256, attribution: ATTR },
+    labels: { type: "raster", tiles: LABEL_TILES, tileSize: 256 }
+  },
+  layers: [
+    { id: "carto", type: "raster", source: "carto" },
+    { id: "sat-labels", type: "raster", source: "labels", layout: { visibility: sat ? "visible" : "none" } }
+  ]
 });
 const map = new maplibregl.Map({ container: "map", style: basemap(theme),
   center: [-81.4, 28.6], zoom: 8.4, attributionControl: { compact: true } });
 map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
 function applyBasemap(t) {
-  map.getSource("carto") && map.getSource("carto").setTiles(
-    ["a","b","c","d"].map(s => `https://${s}.basemaps.cartocdn.com/${t==="dark"?"dark_all":"light_all"}/{z}/{x}/{y}@2x.png`));
+  const src = map.getSource("carto");
+  src && src.setTiles(sat ? ESRI_TILES : CARTO_TILES(t));
+  map.getLayer("sat-labels") && map.setLayoutProperty("sat-labels", "visibility", sat ? "visible" : "none");
 }
+const satBtn = document.getElementById("satBtn");
+satBtn.classList.toggle("on", sat);
+satBtn.onclick = () => {
+  sat = !sat;
+  localStorage.setItem("basemap", sat ? "sat" : "map");
+  satBtn.classList.toggle("on", sat);
+  applyBasemap(theme);
+};
 
 // ---------- data loading ----------
 async function pageAll(path, params) {
